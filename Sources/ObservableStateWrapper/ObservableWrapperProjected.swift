@@ -11,12 +11,28 @@
 //
 //===----------------------------------------------------------------------===//
 
-/// Optional refinement for wrappers that can expose a projected value ($property).
+/// Optional refinement for wrappers that expose a projected value (`$property`).
 ///
-/// Adopt this when your wrapper has a natural projection you want the macro to
-/// surface via a `$name` peer (e.g., `PresentationState<State>`). When you use
-/// `@ObservableStateWrapper(..., projected: true)`, the macro emits a projected peer of
-/// type `StorageType.Projected` and reads/writes through `storage.projectedValue`.
+/// Adopt this when your wrapper has a natural projection you want the macro to surface
+/// via a `$name` peer (e.g., `PresentationState<State>`). When you use
+/// `@ObservableStateWrapper(..., projected: true)`, the macro emits a projected peer whose
+/// type is `StorageType.ProjectedValue` and whose accessors read/write through
+/// `storage.projectedValue`.
+///
+/// Example
+/// ```swift
+/// @propertyWrapper
+/// struct PresentationState<T> {
+///   var wrappedValue: T?
+///   var projectedValue: Binding<Bool>
+/// }
+///
+/// extension PresentationState: ObservableWrapperProjected {
+///   typealias WrappedValue = T?
+///   typealias ProjectedValue = Binding<Bool>
+///   static func makeWrapper(from value: T?, config: ()) -> Self { .init(wrappedValue: value, projectedValue: .constant(value != nil)) }
+/// }
+/// ```
 public protocol ObservableWrapperProjected<WrappedValue>: ObservableWrapper {
     associatedtype ProjectedValue
 }

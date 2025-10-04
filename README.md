@@ -2,6 +2,10 @@
 
 Observation‑correct, wrapper‑backed state for The Composable Architecture (TCA).
 
+This package provides the `@ObservableStateWrapper` attached Swift macro and a couple of tiny helper
+protocols for wrapper authors. You import the library and use the macro in your feature's state; there
+is no runtime dependency beyond what your wrapper types provide.
+
 ## Why this exists
 
 TCA’s `@ObservableState` synthesizes accessors that record reads and notify writes. Unfortunately, this conflicts with using your own `@propertyWrapper` storage in state:
@@ -9,7 +13,7 @@ TCA’s `@ObservableState` synthesizes accessors that record reads and notify wr
 - You can’t attach a custom wrapper to a stored property and still have reads/writes participate in observation.
 - Hand‑written forwarding accessors are boilerplate and easy to get wrong (especially `_modify`).
 
-`@ObservableStateWrapper` solves this by generating observation‑aware accessors for a wrapper‑backed property, so your state stays observable while you keep your storage semantics (clamping, boxing, omit‑coding, presentation, etc.). This macro targets TCA’s registrar (`_$observationRegistrar`) and is specific to `@ObservableState` — it is not a drop‑in for SwiftUI’s `@Observable`.
+`@ObservableStateWrapper` is an attached macro that generates observation‑aware accessors for a wrapper‑backed property, so your state stays observable while you keep your storage semantics (clamping, boxing, omit‑coding, presentation, etc.). This macro targets TCA’s registrar (`_$observationRegistrar`) and is specific to `@ObservableState` — it is not a drop‑in for SwiftUI’s `@Observable`.
 
 ## What it does
 
