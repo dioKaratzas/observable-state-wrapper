@@ -16,37 +16,49 @@ import SwiftOperators
 import SwiftDiagnostics
 import SwiftSyntaxMacros
 import SwiftSyntaxBuilder
+import SwiftSyntaxMacroExpansion
 
-#if !canImport(SwiftSyntax600)
-    import SwiftSyntaxMacroExpansion
-#endif
-
+/// # ObservableStateWrapper
+/// Macro that wires a stored property to a wrapper type providing
+/// `wrappedValue` access, projected access (optional), and hooks for
+/// observation/registration.
+///
+/// ## Requirements for annotated property
+/// - Must be a **stored** `var` (no explicit accessors)
+/// - Must have an **explicit** type annotation
+/// - Only **simple identifier** bindings are supported
+/// - First unlabeled attribute argument must be a **Type.self** expression
+/// - `@ObservationStateIgnored` **must** also decorate the property and
+///   **must** appear **after** this macro attribute
 public enum ObservableStateWrapper: AccessorMacro, PeerMacro {
+    // MARK: - AccessorMacro
     public static func expansion(
         of attribute: AttributeSyntax,
         providingAccessorsOf declaration: some DeclSyntaxProtocol,
         in context: some MacroExpansionContext
     ) throws -> [AccessorDeclSyntax] {
-        guard let configuration = ObservableStateWrapperConfiguration(
+        guard let configuration = ObservableStateWrapperConfiguration.make(
             attribute: attribute,
             declaration: declaration,
-            context: context
+            context: context,
+            emitDiagnostics: true
         ) else {
             return []
         }
-
         return configuration.makeAccessors()
     }
 
+    // MARK: - PeerMacro
     public static func expansion(
         of attribute: AttributeSyntax,
         providingPeersOf declaration: some DeclSyntaxProtocol,
         in context: some MacroExpansionContext
     ) throws -> [DeclSyntax] {
-        guard let configuration = ObservableStateWrapperConfiguration(
+        guard let configuration = ObservableStateWrapperConfiguration.make(
             attribute: attribute,
             declaration: declaration,
-            context: context
+            context: context,
+            emitDiagnostics: false
         ) else {
             return []
         }
@@ -59,14 +71,20 @@ public enum ObservableStateWrapper: AccessorMacro, PeerMacro {
     }
 }
 
+// MARK: - Configuration
 private struct ObservableStateWrapperConfiguration {
+    // MARK: Constants
+    private static let wrapperAttrName = "ObservableStateWrapper"
+    private static let ignoredAttrName = "ObservationStateIgnored"
+
+    /// Small bag of strings used to render code with `SwiftSyntaxBuilder`.
     private struct Strings {
-        let wrapperTypeBase: String
-        let configArgumentSuffix: String
-        let storageType: String
-        let storageName: String
-        let initialWrapperValue: String
-        let keyPath: String
+        let wrapperTypeBase: String // e.g., `Wrapper<Foo>`
+        let configArgumentSuffix: String // e.g., `, config: someExpr`
+        let storageType: String // same as `wrapperTypeBase` (aliased for clarity)
+        let storageName: String // e.g., `_<property>`
+        let initialWrapperValue: String // inline initializer or `nil`
+        let keyPath: String // property name as key path tail
     }
 
     private let strings: Strings
@@ -76,120 +94,132 @@ private struct ObservableStateWrapperConfiguration {
     private let isOptional: Bool
     private let hasExplicitInitializer: Bool
 
+    // MARK: Factory
+    /// Factory wrapper to keep the initializer lean and readable.
+    static func make(
+        attribute: AttributeSyntax,
+        declaration: some DeclSyntaxProtocol,
+        context: some MacroExpansionContext,
+        emitDiagnostics: Bool
+    ) -> ObservableStateWrapperConfiguration? {
+        Self(attribute: attribute, declaration: declaration, context: context, emitDiagnostics: emitDiagnostics)
+    }
+
+    // MARK: Init
     init?(
         attribute: AttributeSyntax,
         declaration: some DeclSyntaxProtocol,
-        context: some MacroExpansionContext
+        context: some MacroExpansionContext,
+        emitDiagnostics: Bool = true
     ) {
+        // Local diagnose helper that can be silenced per call site.
+        let diagnose: (Syntax, ObservableStateWrapperDiagnostic) -> Void = { node, message in
+            if emitDiagnostics {
+                context.diagnose(.init(node: node, message: message))
+            }
+        }
+
+        // Validate declaration kind & shape
         guard let variable = declaration.as(VariableDeclSyntax.self) else {
-            context.diagnose(.init(
-                node: attribute,
-                message: ObservableStateWrapperDiagnostic.invalidDeclarationPlacement
-            ))
+            diagnose(Syntax(attribute), .invalidDeclarationPlacement)
             return nil
         }
 
         guard let binding = variable.bindings.first, variable.bindings.count == 1 else {
-            context.diagnose(.init(node: attribute, message: ObservableStateWrapperDiagnostic.unsupportedMultiBinding))
+            diagnose(Syntax(attribute), .unsupportedMultiBinding)
             return nil
         }
 
+        // Must be a `var` so we can synthesize accessors
         guard variable.bindingSpecifier.tokenKind == .keyword(.var) else {
-            context.diagnose(.init(
-                node: variable.bindingSpecifier,
-                message: ObservableStateWrapperDiagnostic.requiresVar
-            ))
+            diagnose(Syntax(variable.bindingSpecifier), .requiresVar)
             return nil
         }
 
+        // Stored property only — no pre-existing accessor block
         if let accessorBlock = binding.accessorBlock {
-            context.diagnose(.init(
-                node: accessorBlock,
-                message: ObservableStateWrapperDiagnostic.existingAccessorsNotSupported
-            ))
+            diagnose(Syntax(accessorBlock), .existingAccessorsNotSupported)
             return nil
         }
 
+        // Explicit type required
         guard let typeAnnotation = binding.typeAnnotation else {
-            context.diagnose(.init(node: binding.pattern, message: ObservableStateWrapperDiagnostic.requiresExplicitType))
+            diagnose(Syntax(binding.pattern), .requiresExplicitType)
             return nil
         }
 
+        // Only simple identifier bindings (no tuples/patterns)
         guard let identifierPattern = binding.pattern.as(IdentifierPatternSyntax.self) else {
-            context.diagnose(.init(node: binding.pattern, message: ObservableStateWrapperDiagnostic.unsupportedPattern))
+            diagnose(Syntax(binding.pattern), .unsupportedPattern)
             return nil
         }
 
+        // Parse attribute arguments
         guard let argumentList = attribute.arguments?.as(LabeledExprListSyntax.self) else {
-            context.diagnose(.init(node: attribute, message: ObservableStateWrapperDiagnostic.missingWrapperArgument))
+            diagnose(Syntax(attribute), .missingWrapperArgument)
             return nil
         }
 
-        var wrapperArgIndex: LabeledExprListSyntax.Index? = nil
-        if wrapperArgIndex == nil, let first = argumentList.first, first.label == nil {
-            wrapperArgIndex = argumentList.startIndex
-        }
-        guard let wrapperArgIndex else {
-            context.diagnose(.init(node: attribute, message: ObservableStateWrapperDiagnostic.missingWrapperArgument))
+        // First **unlabeled** argument must be `Type.self`
+        guard let wrapperArgIndex = argumentList.firstIndex(where: { $0.label == nil }) else {
+            diagnose(Syntax(attribute), .missingWrapperArgument)
             return nil
         }
-
         let wrapperArg = argumentList[wrapperArgIndex]
 
+        // Expect a well-formed `Type.self`
         guard
             let memberAccess = wrapperArg.expression.as(MemberAccessExprSyntax.self),
             memberAccess.declName.baseName.text == "self",
             let wrapperBase = memberAccess.base?.trimmed else {
-            // Silent no-op expansion if wrapper is malformed.
+            diagnose(Syntax(wrapperArg.expression), .invalidWrapperExpression)
             return nil
         }
 
-        // Optional configuration argument: config: <expr>
-        let configExpr: ExprSyntax? = {
-            if let cfgIndex = argumentList.firstIndex(where: { $0.label?.text == "config" }) {
-                return argumentList[cfgIndex].expression.trimmed
-            }
+        // Enforce TCA interop: ensure `@ObservationStateIgnored` exists and is ordered **after** this macro
+        let order = Self.findAttributeOrder(in: variable)
+        guard order.hasObservationStateIgnored else {
+            diagnose(Syntax(attribute), .missingObservationStateIgnored)
             return nil
-        }()
+        }
+        if let wrapperIdx = order.wrapperIndex, let ignoredIdx = order.ignoredIndex, wrapperIdx > ignoredIdx {
+            diagnose(order.ignoredAttrNode ?? Syntax(variable), .incorrectAttributeOrder)
+            return nil
+        }
 
-        // Optional projected flag: projected: true/false
-        let projectedFlag: Bool = {
-            if let idx = argumentList.firstIndex(where: { $0.label?.text == "projected" }),
-               let bool = argumentList[idx].expression.as(BooleanLiteralExprSyntax.self) {
-                return bool.literal.tokenKind == .keyword(.true)
-            }
-            return false
-        }()
+        let configExpr = Self.readConfigExpr(from: argumentList)
+        let projectedFlag = Self.readProjectedFlag(from: argumentList)
 
+        // Infer declaration traits used later to decide storage init strategy
         let declaredType = typeAnnotation.type.trimmed
-        let normalizedType = ObservableStateWrapperConfiguration.normalizeImplicitlyUnwrappedOptional(type: declaredType)
-        // Track optionality and presence of an explicit initializer. When non-optional and
-        // lacking an initializer, we defer storage initialization to the user's initializer.
+        // Normalize IUO (e.g., `T!`) to `T?` so we treat it uniformly as optional
+        let normalizedType = Self.normalizeImplicitlyUnwrappedOptional(type: declaredType)
         self.isOptional = normalizedType.is(OptionalTypeSyntax.self)
         self.hasExplicitInitializer = (binding.initializer != nil)
-        let storageName = "_" + identifierPattern.identifier.text
+
+        // Pre-compute strings that feed the builders
+        let propertyName = identifierPattern.identifier.text
+        let storageName = "_" + propertyName
         let wrapperTypeBaseDescription = wrapperBase.trimmedDescription
-        let storageType = ObservableStateWrapperConfiguration.makeStorageType(
-            from: wrapperTypeBaseDescription,
-            valueType: normalizedType.trimmedDescription
-        )
-        let configSuffix = configExpr.map { expr in ", config: \(expr.trimmedDescription)" } ?? ""
+        let configSuffix = configExpr.map { ", config: \($0.trimmedDescription)" } ?? ""
         let initialValueDescription = binding.initializer?.value.trimmedDescription ?? "nil"
 
         self.strings = Strings(
             wrapperTypeBase: wrapperTypeBaseDescription,
             configArgumentSuffix: configSuffix,
-            storageType: storageType,
+            storageType: wrapperTypeBaseDescription,
             storageName: storageName,
             initialWrapperValue: initialValueDescription,
-            keyPath: identifierPattern.identifier.text
+            keyPath: propertyName
         )
         self.emitProjected = projectedFlag
     }
 
-    func makeAccessors() -> [AccessorDeclSyntax] {
-        let keyPathReference = "\\.\(strings.keyPath)"
+    // MARK: Synonyms & Small Helpers
+    private var keyPathReference: String { "\\.\(strings.keyPath)" }
 
+    // MARK: Builders
+    func makeAccessors() -> [AccessorDeclSyntax] {
         let initAccessor: AccessorDeclSyntax =
             """
             @storageRestrictions(initializes: \(raw: strings.storageName))
@@ -213,6 +243,7 @@ private struct ObservableStateWrapperConfiguration {
             _$observationRegistrar.mutate(self, keyPath: \(raw: keyPathReference), &\(raw: strings.storageName), newWrapper, _$isIdentityEqual)
             }
             """
+
         let modifyAccessor: AccessorDeclSyntax =
             """
             _modify {
@@ -226,45 +257,53 @@ private struct ObservableStateWrapperConfiguration {
             yield &value
             }
             """
+
         return [initAccessor, getter, setter, modifyAccessor]
     }
 
+    /// Creates the private storage. If the declared property is optional or has
+    /// an explicit initializer, we synthesize a default storage initializer
+    /// using that expression (or `nil`). Otherwise, we leave it uninitialized so
+    /// users can wire it up inside custom `init`s.
     func makeStorage() -> DeclSyntax {
-        // If the declared property has an explicit initializer or is optional, synthesize a
-        // default storage initializer using that expression (or nil). Otherwise, leave the
-        // storage uninitialized so it can be set inside a custom initializer.
         if hasExplicitInitializer || isOptional {
-            return """
-            @ObservationStateIgnored
-            private var \(raw: strings.storageName): \(raw: strings.storageType) = \(raw: strings.wrapperTypeBase).makeWrapper(from: \(raw: strings.initialWrapperValue)\(raw: strings.configArgumentSuffix))
-            """
+            return
+                """
+                @ObservationStateIgnored
+                private var \(raw: strings.storageName): \(raw: strings.storageType) = \(raw: strings.wrapperTypeBase).makeWrapper(from: \(raw: strings.initialWrapperValue)\(raw: strings.configArgumentSuffix))
+                """
         } else {
-            return """
-            @ObservationStateIgnored
-            private var \(raw: strings.storageName): \(raw: strings.storageType)
-            """
+            return
+                """
+                @ObservationStateIgnored
+                private var \(raw: strings.storageName): \(raw: strings.storageType)
+                """
         }
     }
 
+    /// Creates the projected `$property` peer, when requested via
+    /// `projected: true`.
     func makeProjectedPeer() -> DeclSyntax? {
         guard emitProjected else {
             return nil
         }
-        let keyPathReference = "\\.\(strings.keyPath)"
         let projectedName = "$" + strings.keyPath
-        return """
-        var \(raw: projectedName): \(raw: strings.storageType).ProjectedValue {
-        get {
-        _$observationRegistrar.access(self, keyPath: \(raw: keyPathReference))
-        return \(raw: strings.storageName).projectedValue
-        }
-        set {
-        _$observationRegistrar.mutate(self, keyPath: \(raw: keyPathReference), &\(raw: strings.storageName).projectedValue, newValue, _$isIdentityEqual)
-        }
-        }
-        """
+        return
+            """
+            var \(raw: projectedName): \(raw: strings.storageType).ProjectedValue {
+            get {
+            _$observationRegistrar.access(self, keyPath: \(raw: keyPathReference))
+            return \(raw: strings.storageName).projectedValue
+            }
+            set {
+            _$observationRegistrar.mutate(self, keyPath: \(raw: keyPathReference), &\(raw: strings.storageName).projectedValue, newValue, _$isIdentityEqual)
+            }
+            }
+            """
     }
 
+    // MARK: - Static helpers
+    /// Normalize IUO (`T!`) into optional (`T?`) so optionality logic is consistent.
     private static func normalizeImplicitlyUnwrappedOptional(type: TypeSyntax) -> TypeSyntax {
         if let implicitlyUnwrapped = type.as(ImplicitlyUnwrappedOptionalTypeSyntax.self) {
             let optional = OptionalTypeSyntax(
@@ -276,15 +315,59 @@ private struct ObservableStateWrapperConfiguration {
         return type
     }
 
-    private static func makeStorageType(from wrapper: String, valueType: String) -> String {
-        if wrapper.contains("<") {
-            return wrapper
+    /// Returns the `config:` expression when present.
+    private static func readConfigExpr(from arguments: LabeledExprListSyntax) -> ExprSyntax? {
+        guard let cfgIndex = arguments.firstIndex(where: { $0.label?.text == "config" }) else {
+            return nil
         }
+        return arguments[cfgIndex].expression.trimmed
+    }
 
-        return "\(wrapper)<\(valueType)>"
+    /// Returns the `projected:` boolean flag, defaulting to `false`.
+    private static func readProjectedFlag(from arguments: LabeledExprListSyntax) -> Bool {
+        guard
+            let idx = arguments.firstIndex(where: { $0.label?.text == "projected" }),
+            let bool = arguments[idx].expression.as(BooleanLiteralExprSyntax.self) else {
+            return false
+        }
+        return bool.literal.tokenKind == .keyword(.true)
+    }
+
+    /// Finds indices of the relevant attributes to enforce ordering rules.
+    private static func findAttributeOrder(in variable: VariableDeclSyntax) -> (
+        hasObservationStateIgnored: Bool,
+        wrapperIndex: Int?,
+        ignoredIndex: Int?,
+        ignoredAttrNode: Syntax?
+    ) {
+        var hasObservationStateIgnored = false
+        var wrapperIndex: Int? = nil
+        var ignoredIndex: Int? = nil
+        var ignoredAttrNode: Syntax? = nil
+
+        for (attributeIndex, element) in variable.attributes.enumerated() {
+            guard let attr = element.as(AttributeSyntax.self) else {
+                continue
+            }
+            let simpleName = lastPathComponent(of: attr.attributeName.trimmedDescription)
+            if simpleName == wrapperAttrName {
+                wrapperIndex = attributeIndex
+            } else if simpleName == ignoredAttrName {
+                ignoredIndex = attributeIndex
+                ignoredAttrNode = Syntax(attr)
+                hasObservationStateIgnored = true
+            }
+        }
+        return (hasObservationStateIgnored, wrapperIndex, ignoredIndex, ignoredAttrNode)
+    }
+
+    /// Returns the last path component of a possibly module-qualified attribute name.
+    private static func lastPathComponent(of name: String) -> String {
+        name.split(separator: ".").last.map(String.init) ?? name
     }
 }
 
+// MARK: - Diagnostics
 private enum ObservableStateWrapperDiagnostic: DiagnosticMessage {
     case invalidDeclarationPlacement
     case unsupportedMultiBinding
@@ -294,6 +377,8 @@ private enum ObservableStateWrapperDiagnostic: DiagnosticMessage {
     case unsupportedPattern
     case missingWrapperArgument
     case invalidWrapperExpression
+    case missingObservationStateIgnored
+    case incorrectAttributeOrder
 
     var severity: DiagnosticSeverity { .error }
 
@@ -315,10 +400,12 @@ private enum ObservableStateWrapperDiagnostic: DiagnosticMessage {
             return "@ObservableStateWrapper requires a wrapper type argument (first positional parameter)"
         case .invalidWrapperExpression:
             return "The wrapper type argument must be a type reference followed by '.self'"
+        case .missingObservationStateIgnored:
+            return "Add @ObservationStateIgnored to this property to avoid duplicate accessors from @ObservableState."
+        case .incorrectAttributeOrder:
+            return "Place @ObservationStateIgnored after this macro. Correct: @ObservableStateWrapper(...) @ObservationStateIgnored var name: Type"
         }
     }
 
-    var diagnosticID: MessageID {
-        MessageID(domain: "ObservableStateWrapper", id: String(describing: self))
-    }
+    var diagnosticID: MessageID { MessageID(domain: "ObservableStateWrapper", id: String(describing: self)) }
 }
