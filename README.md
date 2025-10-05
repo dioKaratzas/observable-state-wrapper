@@ -40,10 +40,11 @@ Expansion example
 var value: T = initial
 
 // Expansion
+@ObservationStateIgnored
 var value: T {
   @storageRestrictions(initializes: _value)
   init(initialValue) {
-    _value = Wrapper.makeWrapper(from: initialValue)
+    _value = Wrapper<T>.makeWrapper(from: initialValue)
   }
   get {
     _$observationRegistrar.access(self, keyPath: \.value)
@@ -66,7 +67,7 @@ var value: T {
 }
 
 @ObservationStateIgnored
-private var _value: Wrapper<T> = Wrapper.makeWrapper(from: initial)
+private var _value: Wrapper<T> = Wrapper<T>.makeWrapper(from: initial)
 
 // If projected: true
 var $value: Wrapper<T>.ProjectedValue {
@@ -239,6 +240,8 @@ extension Box: ObservableWrapper {
 - Property must be `var` and have an explicit type
 - Comma‑separated bindings are not supported
 - Properties that already declare accessors are not supported
+- Missing `@ObservationStateIgnored` when used inside `@ObservableState`
+- Incorrect attribute order: place `@ObservationStateIgnored` after `@ObservableStateWrapper`
 
 Note: When `projected: true` but the wrapper does not provide a `projectedValue` and matching `ProjectedValue` type, the projected peer will fail to compile for that property — by design.
 
